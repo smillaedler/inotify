@@ -32,6 +32,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"unsafe"
 )
@@ -48,14 +49,13 @@ type watch struct {
 }
 
 type Watcher struct {
-	mu       sync.Mutex
-	fd       int               // File descriptor (as returned by the inotify_init() syscall)
-	watches  map[string]*watch // Map of inotify watches (key: path)
-	paths    map[int]string    // Map of watched paths (key: watch descriptor)
-	Error    chan error        // Errors are sent on this channel
-	Event    chan *Event       // Events are returned on this channel
-	done     chan bool         // Channel for sending a "quit message" to the reader goroutine
-	isClosed bool              // Set to true when Close() is first called
+	mu      sync.Mutex
+	fd      int               // File descriptor (as returned by the inotify_init() syscall)
+	watches map[string]*watch // Map of inotify watches (key: path)
+	paths   map[int]string    // Map of watched paths (key: watch descriptor)
+	Error   chan error        // Errors are sent on this channel
+	Event   chan *Event       // Events are returned on this channel
+	state   *int32            // 0 sleeping 1 running -1 closing -2 closed
 }
 
 // NewWatcher creates and returns a new inotify instance using inotify_init(2)
@@ -70,10 +70,9 @@ func NewWatcher() (*Watcher, error) {
 		paths:   make(map[int]string),
 		Event:   make(chan *Event),
 		Error:   make(chan error),
-		done:    make(chan bool, 1),
+		state:   new(int32),
 	}
 
-	go w.readEvents()
 	return w, nil
 }
 
@@ -81,32 +80,40 @@ func NewWatcher() (*Watcher, error) {
 // It sends a message to the reader goroutine to quit and removes all watches
 // associated with the inotify instance
 func (w *Watcher) Close() error {
-	if w.isClosed {
+	if atomic.LoadInt32(w.state) < 0 {
 		return nil
 	}
-	w.isClosed = true
-
-	// Send "quit" message to the reader goroutine
-	w.done <- true
-
+	if atomic.CompareAndSwapInt32(w.state, 1, -1) && len(w.watches) > 0 {
+		for path := range w.watches {
+			w.removeWatch(path)
+		}
+	} else {
+		w.close()
+	}
 	return nil
+}
+func (w *Watcher) close() {
+	atomic.StoreInt32(w.state, -2)
+	err := syscall.Close(w.fd)
+	if err != nil {
+		w.Error <- os.NewSyscallError("close", err)
+	}
+	close(w.Event)
+	close(w.Error)
 }
 
 // AddWatch adds path to the watched file set.
 // The flags are interpreted as described in inotify_add_watch(2).
 func (w *Watcher) AddWatch(path string, flags uint32) error {
-	if w.isClosed {
+	if atomic.LoadInt32(w.state) < 0 {
 		return errors.New("inotify instance already closed")
 	}
-
+	w.mu.Lock() // synchronize with readEvents goroutine
 	watchEntry, found := w.watches[path]
 	if found {
 		watchEntry.flags |= flags
 		flags |= syscall.IN_MASK_ADD
 	}
-
-	w.mu.Lock() // synchronize with readEvents goroutine
-	defer w.mu.Unlock()
 
 	wd, err := syscall.InotifyAddWatch(w.fd, path, flags)
 	if err != nil {
@@ -121,6 +128,11 @@ func (w *Watcher) AddWatch(path string, flags uint32) error {
 		w.watches[path] = &watch{wd: uint32(wd), flags: flags}
 		w.paths[wd] = path
 	}
+	w.mu.Unlock()
+	if atomic.CompareAndSwapInt32(w.state, 0, 1) {
+		go w.readEvents()
+
+	}
 	return nil
 }
 
@@ -131,29 +143,29 @@ func (w *Watcher) Watch(path string) error {
 
 // RemoveWatch removes path from the watched file set.
 func (w *Watcher) RemoveWatch(path string) error {
-	if w.isClosed {
-		return errors.New(fmt.Sprintf("can't remove non-existent inotify watch for: %s", path))
+	if atomic.LoadInt32(w.state) < 0 {
+		return fmt.Errorf("can't remove non-existent inotify watch for: %s", path)
 	}
 	w.mu.Lock()
-	defer w.mu.Unlock()
+	err := w.removeWatch(path)
+	w.mu.Unlock()
+	return err
+}
+
+func (w *Watcher) removeWatch(path string) error {
 	watch, ok := w.watches[path]
 	if !ok {
-		return errors.New(fmt.Sprintf("can't remove non-existent inotify watch for: %s", path))
+		return fmt.Errorf("can't remove non-existent inotify watch for: %s", path)
 	}
+	if len(w.watches) == 1 {
+		atomic.CompareAndSwapInt32(w.state, 1, 0)
+	}
+	delete(w.watches, path)
 	success, errno := syscall.InotifyRmWatch(w.fd, watch.wd)
 	if success == -1 {
 		return os.NewSyscallError("inotify_rm_watch", errno)
 	}
-	delete(w.watches, path)
-	delete(w.paths, int(watch.wd))
 	return nil
-}
-
-func newFdSet(fd int) *syscall.FdSet {
-	fds := new(syscall.FdSet)
-	elemSize := 32 * 32 / len(fds.Bits)
-	fds.Bits[fd/elemSize] |= 1 << uint(fd%elemSize)
-	return fds
 }
 
 // readEvents reads from the inotify file descriptor, converts the
@@ -161,33 +173,21 @@ func newFdSet(fd int) *syscall.FdSet {
 func (w *Watcher) readEvents() {
 	var buf [syscall.SizeofInotifyEvent * 4096]byte
 
-	// Timeout after 500 milliseconds when waiting for events
-	// so we can reliably close the Watcher
-	timeout := int64(500e6)
-	readFds := newFdSet(w.fd)
 	for {
-		var n int
-		var err error
-		select {
 		// See if there is a message on the "done" channel
-		case <-w.done:
-		// Otherwise select fd with timeout
-		default:
-			tmpSet := *readFds
-			timeval := syscall.NsecToTimeval(timeout)
-			n, err = syscall.Select(w.fd+1, &tmpSet, nil, nil, &timeval)
-			if n == 1 {
-				n, err = syscall.Read(w.fd, buf[0:])
-			} else if err != nil {
-				w.Error <- err
-			} else {
-				continue
+		if state := atomic.LoadInt32(w.state); state != 1 {
+			if state == -1 {
+				w.close()
 			}
+			return
 		}
-
+		n, err := syscall.Read(w.fd, buf[0:])
 		// If EOF or a "done" message is received
 		if n == 0 {
-			goto done
+			if atomic.LoadInt32(w.state) >= -1 {
+				w.close()
+			}
+			return
 		}
 		if n < 0 {
 			w.Error <- os.NewSyscallError("read", err)
@@ -233,18 +233,6 @@ func (w *Watcher) readEvents() {
 			// Move to the next event in the buffer
 			offset += syscall.SizeofInotifyEvent + nameLen
 		}
-	}
-done:
-	w.isClosed = true // keep API behaviour consistent when EOF was read
-	err := syscall.Close(w.fd)
-	if err != nil {
-		w.Error <- os.NewSyscallError("close", err)
-	}
-	close(w.Event)
-	close(w.Error)
-	for path, watch := range w.watches {
-		delete(w.watches, path)
-		delete(w.paths, int(watch.wd))
 	}
 }
 
